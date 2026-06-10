@@ -415,13 +415,13 @@ const SHEET_TAB = 'Sheet1';
 const SHEET_ID  = '1R3WiRuJkfL1MzaS9DALY04AtrLHZBcWVovA229bBtps';
 const SHEET_URL = `https://opensheet.elk.sh/${SHEET_ID}/${SHEET_TAB}`;
 
-const TRACKING_ENDPOINT = 'https://script.google.com/macros/s/AKfycbxJvcOsm8dO9X1Q9FSNDTea0qhpdNSMj-rY8irFHoCJgyNYHA1aFWgrTmG14LMPmNPI/exec';
+const TRACKING_ENDPOINT = 'https://script.google.com/macros/s/AKfycbzn3vNcswER52LA1d16j8FusrqTsjMMRFSVKbtJyPpGw7oCklWQ4D6bZ_PyXYyzBEHU/exec';
 const TRACKING_ENABLED  = true;
 
 const DELIVERY_ONLY_FIRST    = true;
 const FALLBACK_TO_ANY_BRANCH = true;
 const AUTO_REDIRECT_TO_WHATSAPP = true;
-const AUTO_REDIRECT_DELAY_MS    = 700;
+const AUTO_REDIRECT_DELAY_MS    = 1800;
 
 /* ──────────────────────────────────────────────────────
    SESSION ID — جديد مع كل Page Load (بدون sessionStorage)
@@ -599,6 +599,7 @@ const tracking = {
   whatsappClickTime:   '',
   whatsappUrl:         '',
   whatsappMessageType: 'unknown',
+  whatsappTriggerType: 'unknown',
   clickedMaps:         false,
   mapsClickTime:       '',
   mapsUrl:             '',
@@ -690,6 +691,7 @@ function buildTrackingPayload(eventType, extra) {
     whatsappClickTime:       tracking.whatsappClickTime,
     whatsappUrl:             tracking.whatsappUrl,
     whatsappMessageType:     tracking.whatsappMessageType,
+    whatsappTriggerType:     tracking.whatsappTriggerType,
 
     // ── Maps ──
     clickedMaps:             tracking.clickedMaps,
@@ -824,25 +826,38 @@ function trackBranchSelected(branch, options) {
   sendTrackingEvent('branch_selected');
 }
 
-function trackWhatsappClick(branch, isManual) {
-  tracking.clickedWhatsapp   = true;
-  tracking.whatsappClickTime = new Date().toISOString();
+function trackWhatsappClick(branch, isManual, triggerType) {
+  // منع تكرار whatsapp_click إذا ضغط العميل الزر وفي نفس الوقت تم التحويل التلقائي
+  if (tracking.clickedWhatsapp) return;
+
+  tracking.clickedWhatsapp    = true;
+  tracking.whatsappClickTime  = new Date().toISOString();
+  tracking.whatsappTriggerType = triggerType || (isManual ? 'manual_click' : 'manual_click');
+
   if (branch) tracking.nearestBranch = branch;
+
   tracking.exitReason = 'converted_whatsapp';
   markFinalStatus('whatsapp_clicked');
+
   const evType = isManual ? 'manual_whatsapp_click' : 'whatsapp_click';
   sendTrackingEvent(evType, null, true);
 }
 
 function trackMapsClick(branch, isManual) {
+  // منع تكرار maps_click من نفس page load
+  if (tracking.clickedMaps) return;
+
   tracking.clickedMaps   = true;
   tracking.mapsClickTime = new Date().toISOString();
+
   if (branch) {
     tracking.nearestBranch = branch;
     tracking.mapsUrl       = branch.googleLink || '';
   }
+
   tracking.exitReason = 'converted_maps';
   markFinalStatus('maps_clicked');
+
   const evType = isManual ? 'manual_maps_click' : 'maps_click';
   sendTrackingEvent(evType, null, true);
 }
@@ -1165,7 +1180,7 @@ function onLocationSuccess(pos) {
     btn.href = waUrl;
     btn.style.display = 'flex';
     btn.addEventListener('click', function() {
-      trackWhatsappClick(nearest, false);
+      trackWhatsappClick(nearest, false, 'manual_click');
     }, { once: true });
   }
 
@@ -1201,7 +1216,7 @@ function onLocationSuccess(pos) {
 
   if (AUTO_REDIRECT_TO_WHATSAPP) {
     setTimeout(function() {
-      trackWhatsappClick(nearest, false);
+      trackWhatsappClick(nearest, false, 'auto_redirect');
       window.location.href = waUrl;
     }, AUTO_REDIRECT_DELAY_MS);
   }
@@ -1277,7 +1292,7 @@ function buildManualList(branches) {
         tracking.deliveryLogicResult   = 'manual_branch_selected';
         tracking.whatsappUrl           = waUrl;
         tracking.whatsappMessageType   = 'manual_branch_request';
-        trackWhatsappClick(branch, true);
+        trackWhatsappClick(branch, true, 'manual_click');
       });
     }
 
