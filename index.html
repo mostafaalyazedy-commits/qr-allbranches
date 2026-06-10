@@ -564,140 +564,239 @@
 'use strict';
 
 /* ════════════════════════════════════════════════════════
-   CONFIG — غيّر اسم التاب هنا لو تغيّر في الشيت
+   OCEAN PHARMACY — NEW GOOGLE SHEET BACKEND LOGIC
+   الجدول الجديد المطلوب:
+   Store Id | Branch Name | اسم الفرع | اسم الشارع | اسم الحي | المدينة |
+   long , Latid | الرقم الموحد | رقم الفرع الداخلي | حالة التوصيل | google link
 ════════════════════════════════════════════════════════ */
-const SHEET_TAB  = 'Sheet1';
-const SHEET_ID   = '1grir_i5EwEXcSqES2Ay2IfF0BomtZ12vp-_8ngRMa7E';
-const SHEET_URL  = `https://opensheet.elk.sh/${SHEET_ID}/${SHEET_TAB}`;
 
-/* رسالة الواتساب الجاهزة */
-function buildMessage(branch) {
-  return encodeURIComponent(
-    `السلام عليكم، أريد الطلب من أقرب فرع لأوشن.\n` +
-    `تم تحديد أقرب فرع تلقائيًا: ${branch.name}\n` +
-    `كود الفرع: ${branch.code}\n` +
-    `المدينة: ${branch.city}`
-  );
-}
+/* مهم: ضع هنا ID الشيت الجديد فقط، وليس الرابط كامل */
+const SHEET_TAB = 'Sheet1';
+const SHEET_ID  = '1R3WiRuJkfL1MzaS9DALY04AtrLHZBcWVovA229bBtps';
+const SHEET_URL = `https://opensheet.elk.sh/${SHEET_ID}/${SHEET_TAB}`;
+
+/* إعدادات اللوجيك */
+const DELIVERY_ONLY_FIRST = true;      // TRUE = يختار أقرب فرع توصيل أولًا
+const FALLBACK_TO_ANY_BRANCH = true;   // لو مفيش فروع توصيل، يستخدم أقرب فرع عادي
+const AUTO_REDIRECT_TO_WHATSAPP = true;
+const AUTO_REDIRECT_DELAY_MS = 700;
 
 /* ════════════════════════════════════════════════════════
-   HELPERS — قراءة الأعمدة بمرونة
+   HELPERS
 ════════════════════════════════════════════════════════ */
-function normalizeKey(k) {
-  return String(k || '').replace(/^\uFEFF/, '').trim().toLowerCase().replace(/[\s_\-\/]+/g, '');
+function normalizeKey(key) {
+  return String(key || '')
+    .replace(/^\uFEFF/, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_\-\/،,]+/g, '');
 }
 
 function getCell(row, aliases) {
-  const targets = aliases.map(normalizeKey);
-  for (const k of Object.keys(row || {})) {
-    if (targets.includes(normalizeKey(k))) return String(row[k] || '').trim();
+  const wanted = aliases.map(normalizeKey);
+  for (const key of Object.keys(row || {})) {
+    if (wanted.includes(normalizeKey(key))) {
+      return String(row[key] ?? '').trim();
+    }
   }
   return '';
 }
 
-/* ── تنظيف رقم الواتساب ── */
-function cleanWA(raw) {
-  if (!raw) return null;
-  // استخرج الرقم من روابط wa.me
-  let num = raw.replace(/https?:\/\/wa\.me\//i, '').trim();
-  // شيل كل حاجة غير أرقام
-  num = num.replace(/[^\d]/g, '');
-  if (!num) return null;
-  // لو بيبدأ بـ 05 (سعودي محلي)
-  if (num.startsWith('05') && num.length === 10) num = '966' + num.slice(1);
-  // لو بيبدأ بـ 5 وطوله 9
-  else if (num.startsWith('5') && num.length === 9) num = '966' + num;
-  // لو بيبدأ بـ 00966
-  else if (num.startsWith('00966')) num = num.slice(2);
-  // لو بيبدأ بـ 966 — تمام
-  if (!num.startsWith('966') || num.length < 11) return null;
-  return num;
+function isTrue(value) {
+  const v = String(value || '').trim().toLowerCase();
+  return ['true', 'yes', 'y', '1', 'متاح', 'نعم', 'صح'].includes(v);
 }
 
-/* ── Haversine ── */
+function cleanPhone(raw) {
+  if (!raw) return null;
+  let num = String(raw).replace(/https?:\/\/wa\.me\//i, '').replace(/[^\d]/g, '');
+  if (!num) return null;
+
+  if (num.startsWith('00966')) num = num.slice(2);
+  if (num.startsWith('9660')) num = '966' + num.slice(4);
+  if (num.startsWith('05') && num.length === 10) num = '966' + num.slice(1);
+  if (num.startsWith('5') && num.length === 9) num = '966' + num;
+
+  return num.startsWith('966') && num.length >= 11 ? num : null;
+}
+
+function parseLatLng(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return { lat: NaN, lng: NaN, ok: false };
+
+  const nums = text.match(/-?\d+(?:\.\d+)?/g);
+  if (!nums || nums.length < 2) return { lat: NaN, lng: NaN, ok: false };
+
+  let a = parseFloat(nums[0]);
+  let b = parseFloat(nums[1]);
+
+  // في الجدول العمود مكتوب long , Latid لكن المثال هو: 24.x, 46.x
+  // لذلك نتحقق تلقائيًا: إحداثيات السعودية غالبًا lat=24 تقريبًا و lng=46 تقريبًا
+  let lat = a;
+  let lng = b;
+
+  if (Math.abs(a) > 35 && Math.abs(b) <= 35) {
+    lat = b;
+    lng = a;
+  }
+
+  const ok = Number.isFinite(lat) && Number.isFinite(lng) &&
+             lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+  return { lat, lng, ok };
+}
+
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
   const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = Math.sin(dLat/2)**2 +
-    Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) * Math.sin(dLon/2)**2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
+
 function fmtDist(km) {
   return km < 1 ? `${Math.round(km * 1000)} متر` : `${km.toFixed(1)} كم`;
 }
 
-/* ── تحويل صف الشيت لكائن فرع ── */
-function normalizeRow(row, i) {
-  const name  = getCell(row, ['Business name','Branch','Store','Store Name','branch_name','Name']);
-  const code  = getCell(row, ['Store code','Code','store_code']);
-  const city  = getCell(row, ['Locality','City','city']);
-  const waRaw = getCell(row, ['whats app link','WhatsApp','whatsapp','whatsapp_link','Primary phone']);
-  const latRaw = getCell(row, ['Latitude','lat','latitude']);
-  const lngRaw = getCell(row, ['Longitude','lng','long','longitude']);
+function htmlEscape(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
-  const wa  = cleanWA(waRaw);
-  const lat = parseFloat(latRaw);
-  const lng = parseFloat(lngRaw);
-  const hasCoords = Number.isFinite(lat) && Number.isFinite(lng) &&
-                    lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+/* ════════════════════════════════════════════════════════
+   NORMALIZE NEW SHEET ROW
+════════════════════════════════════════════════════════ */
+function normalizeRow(row, index) {
+  const storeId       = getCell(row, ['Store Id', 'Store ID', 'store_id', 'كود الفرع']);
+  const branchNameEn  = getCell(row, ['Branch Name', 'branch_name']);
+  const branchNameAr  = getCell(row, ['اسم الفرع']);
+  const street        = getCell(row, ['اسم الشارع', 'street']);
+  const district      = getCell(row, ['اسم الحي', 'district', 'حي']);
+  const city          = getCell(row, ['المدينة', 'city']);
+  const coordsRaw     = getCell(row, ['long , Latid', 'long,latid', 'long latid', 'long, latid', 'lat,lng', 'coordinates', 'الاحداثيات']);
+  const unifiedPhone  = cleanPhone(getCell(row, ['الرقم الموحد', 'unified phone', 'primary phone']));
+  const branchPhone   = cleanPhone(getCell(row, ['رقم الفرع الداخلي', 'branch phone', 'whatsapp', 'واتساب']));
+  const deliveryRaw   = getCell(row, ['حالة التوصيل', 'delivery', 'delivery status']);
+  const googleLink    = getCell(row, ['google link', 'Google Link', 'maps', 'map link']);
+  const coords        = parseLatLng(coordsRaw);
 
-  return { _i: i, name, code, city, wa, lat, lng, hasCoords };
+  const name = branchNameAr || branchNameEn || storeId || `فرع رقم ${index + 1}`;
+  const phone = branchPhone || unifiedPhone;
+
+  return {
+    _i: index,
+    storeId,
+    branchNameEn,
+    branchNameAr,
+    name,
+    street,
+    district,
+    city,
+    lat: coords.lat,
+    lng: coords.lng,
+    hasCoords: coords.ok,
+    unifiedPhone,
+    branchPhone,
+    phone,
+    delivery: isTrue(deliveryRaw),
+    googleLink,
+    raw: row
+  };
+}
+
+function buildMessage(branch, userLocationLink = '') {
+  const lines = [
+    'السلام عليكم، أريد التواصل مع أقرب فرع لصيدلية أوشن.',
+    '',
+    `الفرع: ${branch.name}`,
+    branch.storeId ? `كود الفرع: ${branch.storeId}` : '',
+    branch.city ? `المدينة: ${branch.city}` : '',
+    branch.district ? `الحي: ${branch.district}` : '',
+    branch.street ? `الشارع: ${branch.street}` : '',
+    branch.delivery ? 'حالة التوصيل: متاح' : 'حالة التوصيل: غير مفعّل لهذا الفرع',
+    branch.googleLink ? `رابط الفرع: ${branch.googleLink}` : '',
+    userLocationLink ? `موقع العميل: ${userLocationLink}` : ''
+  ].filter(Boolean);
+
+  return encodeURIComponent(lines.join('\n'));
+}
+
+function buildWhatsappUrl(branch, userLocationLink = '') {
+  if (!branch.phone) return '#';
+  return `https://wa.me/${branch.phone}?text=${buildMessage(branch, userLocationLink)}`;
 }
 
 /* ════════════════════════════════════════════════════════
    STATE MACHINE
 ════════════════════════════════════════════════════════ */
-const states = ['stateLoading','stateAskLocation','stateCalculating','stateSuccess','stateDenied','stateNoData','stateError'];
+const states = ['stateLoading', 'stateAskLocation', 'stateCalculating', 'stateSuccess', 'stateDenied', 'stateNoData', 'stateError'];
+let allBranches = [];
+let lastUserLocationLink = '';
 
 function showState(id) {
-  states.forEach(s => {
-    const el = document.getElementById(s);
-    el.classList.toggle('active', s === id);
+  states.forEach(stateId => {
+    const el = document.getElementById(stateId);
+    if (el) el.classList.toggle('active', stateId === id);
   });
 }
 
 function setStep(n) {
-  [1,2,3].forEach(i => {
+  [1, 2, 3].forEach(i => {
     const el = document.getElementById('step' + i);
-    el.className = 'step' + (i < n ? ' done' : i === n ? ' active' : '');
+    if (el) el.className = 'step' + (i < n ? ' done' : i === n ? ' active' : '');
   });
+}
+
+function setError(message) {
+  const el = document.getElementById('errorMsg');
+  if (el) el.textContent = message;
+  showState('stateError');
 }
 
 /* ════════════════════════════════════════════════════════
    MAIN FLOW
 ════════════════════════════════════════════════════════ */
-let allBranches = [];
-
 async function init() {
   showState('stateLoading');
   setStep(1);
 
   try {
-    const res = await fetch(SHEET_URL);
+    if (!SHEET_ID || SHEET_ID === 'PUT_NEW_GOOGLE_SHEET_ID_HERE') {
+      throw new Error('ضع Google Sheet ID الجديد داخل متغير SHEET_ID');
+    }
+
+    const res = await fetch(SHEET_URL, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    allBranches = data.map((r, i) => normalizeRow(r, i));
 
-    // فروع بواتساب صالح للقائمة اليدوية
-    const withWA = allBranches.filter(b => b.wa);
-    if (!withWA.length) { showState('stateNoData'); return; }
+    const rows = await res.json();
+    allBranches = rows
+      .map((row, i) => normalizeRow(row, i))
+      .filter(branch => branch.name && branch.phone);
 
-    buildManualList(withWA);
+    if (!allBranches.length) {
+      showState('stateNoData');
+      return;
+    }
+
+    buildManualList(allBranches);
     requestLocation();
 
   } catch (err) {
-    document.getElementById('errorMsg').textContent = `تعذّر تحميل البيانات: ${err.message}`;
-    showState('stateError');
+    setError(`تعذّر تحميل بيانات الفروع: ${err.message}`);
   }
 }
 
-/* ── طلب الموقع ── */
 function requestLocation() {
   if (!navigator.geolocation) {
     showManualFallback();
     return;
   }
+
   showState('stateAskLocation');
   setStep(2);
 
@@ -708,84 +807,127 @@ function requestLocation() {
   );
 }
 
+function chooseNearestBranch(userLat, userLng) {
+  const withCoords = allBranches
+    .filter(branch => branch.hasCoords && branch.phone)
+    .map(branch => ({
+      ...branch,
+      dist: haversine(userLat, userLng, branch.lat, branch.lng)
+    }));
+
+  if (!withCoords.length) return null;
+
+  const deliveryBranches = withCoords
+    .filter(branch => branch.delivery)
+    .sort((a, b) => a.dist - b.dist);
+
+  if (DELIVERY_ONLY_FIRST && deliveryBranches.length) {
+    return deliveryBranches[0];
+  }
+
+  if (FALLBACK_TO_ANY_BRANCH) {
+    return withCoords.sort((a, b) => a.dist - b.dist)[0];
+  }
+
+  return null;
+}
+
 function onLocationSuccess(pos) {
   showState('stateCalculating');
   setStep(3);
 
   const userLat = pos.coords.latitude;
   const userLng = pos.coords.longitude;
+  lastUserLocationLink = `https://www.google.com/maps?q=${userLat},${userLng}`;
 
-  // فروع بإحداثيات وواتساب
-  const valid = allBranches.filter(b => b.hasCoords && b.wa);
-  if (!valid.length) { showManualFallback(); return; }
+  const nearest = chooseNearestBranch(userLat, userLng);
+  if (!nearest) {
+    showManualFallback();
+    return;
+  }
 
-  // احسب المسافة لكل فرع
-  const withDist = valid.map(b => ({
-    ...b,
-    dist: haversine(userLat, userLng, b.lat, b.lng)
-  })).sort((a, b) => a.dist - b.dist);
+  const infoName = document.getElementById('infoName');
+  const infoCode = document.getElementById('infoCode');
+  const infoCity = document.getElementById('infoCity');
+  const infoDist = document.getElementById('infoDist');
+  const btn = document.getElementById('btnWhatsapp');
 
-  const nearest = withDist[0];
+  if (infoName) infoName.textContent = nearest.name || '—';
+  if (infoCode) infoCode.textContent = nearest.storeId || '—';
+  if (infoCity) infoCity.textContent = [nearest.city, nearest.district].filter(Boolean).join(' - ') || '—';
+  if (infoDist) infoDist.textContent = `📍 على بُعد ${fmtDist(nearest.dist)}`;
 
-  // أطهر البيانات في الكارد
-  document.getElementById('infoName').textContent = nearest.name || '—';
-  document.getElementById('infoCode').textContent = nearest.code || '—';
-  document.getElementById('infoCity').textContent = nearest.city || '—';
-  document.getElementById('infoDist').textContent = `📍 على بُعد ${fmtDist(nearest.dist)}`;
-
-  const waUrl = `https://wa.me/${nearest.wa}?text=${buildMessage(nearest)}`;
-  const btn   = document.getElementById('btnWhatsapp');
-  btn.href    = waUrl;
+  const waUrl = buildWhatsappUrl(nearest, lastUserLocationLink);
+  if (btn) {
+    btn.href = waUrl;
+    btn.style.display = 'flex';
+    btn.addEventListener('click', () => {
+      sessionStorage.setItem('ocean_last_clicked_branch', nearest.storeId || nearest.name || 'unknown');
+    }, { once: true });
+  }
 
   showState('stateSuccess');
 
-  // iPhone Safari fix — redirect بدون window.open
-  window.location.href = waUrl;
-
-  // Backup button بعد 2.5 ثانية لو المتصفح منع التحويل
-  setTimeout(() => {
-    btn.style.display = 'flex';
-    document.querySelector('#stateSuccess .status-sub').textContent =
-      'لم يفتح واتساب تلقائيًا؟ اضغط الزر أدناه';
-  }, 2500);
+  if (AUTO_REDIRECT_TO_WHATSAPP) {
+    setTimeout(() => {
+      window.location.href = waUrl;
+    }, AUTO_REDIRECT_DELAY_MS);
+  }
 }
 
-function onLocationError(err) {
+function onLocationError() {
   showManualFallback();
 }
 
 function showManualFallback() {
   setStep(2);
+  buildManualList(allBranches);
   showState('stateDenied');
 }
 
-/* ── بناء القائمة اليدوية ── */
 function buildManualList(branches) {
-  const listDenied = document.getElementById('branchesListDenied');
-  listDenied.innerHTML = '';
+  const list = document.getElementById('branchesListDenied');
+  if (!list) return;
 
-  branches.forEach(b => {
-    const waUrl = `https://wa.me/${b.wa}?text=${buildMessage(b)}`;
-    const item  = document.createElement('div');
+  list.innerHTML = '';
+
+  const sorted = [...branches].sort((a, b) => {
+    if (a.delivery !== b.delivery) return a.delivery ? -1 : 1;
+    return (a.storeId || '').localeCompare(b.storeId || '', 'en');
+  });
+
+  sorted.forEach(branch => {
+    const waUrl = buildWhatsappUrl(branch, lastUserLocationLink);
+    const item = document.createElement('div');
     item.className = 'branch-item';
     item.innerHTML = `
       <div class="branch-item-info">
-        <div class="branch-item-name">${b.name || 'فرع'}</div>
-        <div class="branch-item-city">${b.city || ''}</div>
-        ${b.code ? `<span class="branch-item-code">${b.code}</span>` : ''}
+        <div class="branch-item-name">${htmlEscape(branch.name)}</div>
+        <div class="branch-item-city">${htmlEscape([branch.city, branch.district].filter(Boolean).join(' - '))}</div>
+        <span class="branch-item-code">${htmlEscape(branch.storeId || '')}${branch.delivery ? ' · توصيل' : ''}</span>
       </div>
-      <a href="${waUrl}" class="branch-wa-btn" aria-label="واتساب ${b.name}">
+      <a href="${waUrl}" class="branch-wa-btn" aria-label="واتساب ${htmlEscape(branch.name)}">
         <svg viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
       </a>`;
-    listDenied.appendChild(item);
+
+    const link = item.querySelector('a');
+    link.addEventListener('click', () => {
+      sessionStorage.setItem('ocean_last_clicked_branch', branch.storeId || branch.name || 'unknown');
+    });
+
+    list.appendChild(item);
   });
 }
 
-/* ── Buttons ── */
-document.getElementById('btnRetry').addEventListener('click', requestLocation);
-document.getElementById('btnReload').addEventListener('click', () => location.reload());
+/* ════════════════════════════════════════════════════════
+   BUTTONS + START
+════════════════════════════════════════════════════════ */
+const btnRetry = document.getElementById('btnRetry');
+const btnReload = document.getElementById('btnReload');
 
-/* ── Start ── */
+if (btnRetry) btnRetry.addEventListener('click', requestLocation);
+if (btnReload) btnReload.addEventListener('click', () => location.reload());
+
 document.addEventListener('DOMContentLoaded', init);
 </script>
 </body>
